@@ -1,56 +1,117 @@
-from langchain_classic.agents import create_react_agent, AgentExecutor
-from langchain_core.prompts import PromptTemplate
+"""
+Planner node for the GenOS agent graph.
+
+Responsibility: given the user's natural language message, call the correct
+command-generator tool and return the proposed bash command in state.
+
+It does NOT execute the command — that happens in the executor node,
+and only after the critic clears it.
+
+Generator tools available:
+  create_os_command      → general shell, scripts, package management
+  create_file_tool       → file / directory operations
+  create_process_command → process monitoring, kill, service management
+  create_network_command → network diagnostics, curl, ping, ss
+"""
+import logging
+
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langgraph.prebuilt import ToolNode
+
 from brain.llm import llm
+from tools.all_tools import all_tools as GENERATOR_TOOLS
 
-from tools.shelltool import shell_tool
+logger = logging.getLogger(__name__)
 
-def create_agent():
-    tools = [shell_tool]
-    
-    template = """You are a helpful Linux system assistant.
-Your goal is to answer the user's question by executing shell commands on a remote machine.
+# ── Prompt ────────────────────────────────────────────────────────────────────
 
-You have access to the following tools:
-{tools}
+PLANNER_PROMPT = """\
+You are a Linux command planner for a remote SSH agent.
 
-Use the following format:
+Given the user's request, call EXACTLY ONE of your tools to generate the
+appropriate bash command. The tool will return the raw bash command string.
 
-Question: the input question you must answer
-Thought: you should always think about what to do
-Action: the action to take, should be one of [{tool_names}]
-Action Input: the command
-Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can repeat N times)
-Thought: I now know the final answer
-Final Answer: the final answer to the original input question
+Tool selection guide:
+  create_os_command      → general shell, run scripts, package management (apt, pip)
+  create_file_tool       → ls, find, cp, mv, rm, mkdir, cat, zip, tar
+  create_process_command → ps, kill, pkill, systemctl, uptime, top
+  create_network_command → ping, curl, wget, ss, netstat, ip, dig
 
-IMPORTANT RULES:
-1. ALWAYS use non-interactive flags for commands. For example:
-   - Use 'apt-get install -y' instead of 'apt install'
-   - Use 'apt-get upgrade -y' instead of 'apt upgrade'
-2. Prefix administrative commands with 'DEBIAN_FRONTEND=noninteractive' if needed.
-3. If a command times out, it likely requires interactive input. Try again with '-y' or a different approach.
-4. Do not repeat the Question in your thoughts.
+Rules:
+- Call ONE tool only — do not chain tools.
+- Pass the user's request as the "command" argument.
+- Pass recent conversation context as the "context" argument (list of strings).
+- Do NOT attempt to execute anything yourself.
+"""
 
-Begin!
+# ── Tool node (generator tools only — no run_command) ─────────────────────────
+_generator_tool_node = ToolNode(GENERATOR_TOOLS)
 
-Question: {input}
-Thought: {agent_scratchpad}"""
 
-    prompt = PromptTemplate.from_template(template)
+# ── Planner node ──────────────────────────────────────────────────────────────
 
-    agent = create_react_agent(
-        llm=llm,
-        tools=tools,
-        prompt=prompt
-    )
-    
-    executor = AgentExecutor(
-        agent=agent,
-        tools=tools,
-        verbose=True,
-        handle_parsing_errors=True,
-        max_iterations=5
-    )
-    
-    return executor
+def planner_node(state: dict) -> dict:
+    """
+    LangGraph node.
+
+    1. Binds generator tools to the LLM (tool_choice='any' forces a tool call).
+    2. Calls the selected tool to get the proposed bash command.
+    3. Returns the proposed command in state — does NOT execute it.
+    """
+    messages = state.get("messages", [])
+
+    # ── RAG context from ChromaDB (injected by context_retrieval_node) ────────
+    rag_context: str = state.get("context", "")
+
+    # Build context list: RAG results first, then recent conversation turns
+    context_parts = []
+    if rag_context:
+        context_parts.append(rag_context)
+    context_parts += [
+        str(m.content)
+        for m in messages[-4:]
+        if hasattr(m, "content") and m.content
+    ]
+
+    # ── Step 1: LLM picks the right generator tool ─────────────────────────────
+    system = PLANNER_PROMPT
+    if rag_context:
+        system += f"\n\nContext from previous interactions:\n{rag_context}"
+
+    llm_with_tools    = llm.bind_tools(GENERATOR_TOOLS, tool_choice="any")
+    planning_messages = [SystemMessage(content=system)] + messages
+
+    ai_response = llm_with_tools.invoke(planning_messages)
+
+    tool_names = [tc["name"] for tc in (ai_response.tool_calls or [])]
+    logger.info("planner tool calls: %s", tool_names)
+    tool_used = tool_names[0] if tool_names else "unknown"
+
+    # ── Step 2: Execute the selected generator tool ────────────────────────────
+    new_messages     = [ai_response]
+    proposed_command = ""
+
+    if ai_response.tool_calls:
+        # Patch the context arg into the tool call so the inner LLM sees it
+        for tc in ai_response.tool_calls:
+            if "context" in tc.get("args", {}):
+                tc["args"]["context"] = context_parts
+
+        tool_input_state = {"messages": messages + [ai_response]}
+        tool_result      = _generator_tool_node.invoke(tool_input_state)
+        tool_msg: ToolMessage = tool_result["messages"][-1]
+
+        new_messages.append(tool_msg)
+        proposed_command = tool_msg.content.strip()
+
+        logger.info("planner proposed command: %s", proposed_command)
+    else:
+        # Fallback: LLM wrote command directly in content
+        proposed_command = ai_response.content.strip()
+        logger.warning("planner made no tool call — using content as command")
+
+    return {
+        "messages":         new_messages,
+        "proposed_command": proposed_command,
+        "tool_used":        tool_used,
+    }

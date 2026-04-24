@@ -1,6 +1,6 @@
 from langchain.tools import tool
 
-from connectors.ssh import run_command_ssh
+from connectors.ssh_connector import run_command_ssh
 from utils.formatter import format_output
 from config import settings
 

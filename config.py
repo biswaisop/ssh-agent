@@ -3,8 +3,8 @@ from typing import Optional
 
 class Settings(BaseSettings):
     GROQ: str
-    SSH_HOST: str = "localhost"
-    SSH_PORT: int = 2222
+    SSH_HOST: str = "54.206.74.122"
+    SSH_PORT: int = 22
     SSH_USERNAME: str = "ubuntu"
     KEY_PATH: str = "C:/Users/monda/.ssh/id_rsa"
     PASSWORD: Optional[str] = None
